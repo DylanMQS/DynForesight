@@ -1,5 +1,6 @@
 import collections
 import dataclasses
+import hashlib
 import logging
 import math
 import pathlib
@@ -90,7 +91,13 @@ def eval_libero(args: Args) -> None:
             logging.info(f"\nTask: {task_description}")
 
             # Reset environment
-            env.reset()
+            try:
+                env.reset()
+            except Exception as e:
+                logging.error(f"env.reset() failed, skipping episode: {e}")
+                task_episodes += 1
+                total_episodes += 1
+                continue
             action_plan = collections.deque()
 
             # Set initial states
@@ -138,6 +145,14 @@ def eval_libero(args: Args) -> None:
                                 )
                             ),
                             "prompt": str(task_description),
+                            # Optional rollout metadata: stripped server-side
+                            # (see openpi.policies.policy.Policy.infer) and only
+                            # consumed by the PyTorch attention-vis hook for
+                            # rollout-aware folder layout. Harmless otherwise.
+                            "__rollout_task_id__": int(task_id),
+                            "__rollout_episode_id__": int(episode_idx),
+                            "__rollout_step__": int(t - args.num_steps_wait),
+                            "__rollout_task_name__": str(task_description),
                         }
 
                         # Query model to get action
@@ -167,11 +182,20 @@ def eval_libero(args: Args) -> None:
             # Save a replay video of the episode
             suffix = "success" if done else "failure"
             task_segment = task_description.replace(" ", "_")
-            imageio.mimwrite(
-                pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_{suffix}.mp4",
-                [np.asarray(x) for x in replay_images],
-                fps=10,
-            )
+            video_name = f"rollout_{task_segment}_{suffix}.mp4"
+            if len(video_name.encode("utf-8")) > 250:
+                name_hash = hashlib.md5(task_segment.encode()).hexdigest()[:12]
+                max_seg_len = 250 - len(f"rollout__{name_hash}_{suffix}.mp4")
+                task_segment = task_segment[:max_seg_len]
+                video_name = f"rollout_{task_segment}_{name_hash}_{suffix}.mp4"
+            try:
+                imageio.mimwrite(
+                    pathlib.Path(args.video_out_path) / video_name,
+                    [np.asarray(x) for x in replay_images],
+                    fps=10,
+                )
+            except Exception as e:
+                logging.error(f"Failed to save video {video_name}: {e}")
 
             # Log current results
             logging.info(f"Success: {done}")
@@ -190,7 +214,7 @@ def _get_libero_env(task, resolution, seed):
     """Initializes and returns the LIBERO environment, along with the task description."""
     task_description = task.language
     task_bddl_file = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
-    env_args = {"bddl_file_name": task_bddl_file, "camera_heights": resolution, "camera_widths": resolution}
+    env_args = {"bddl_file_name": str(task_bddl_file), "camera_heights": resolution, "camera_widths": resolution}
     env = OffScreenRenderEnv(**env_args)
     env.seed(seed)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
     return env, task_description

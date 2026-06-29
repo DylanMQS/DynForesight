@@ -45,6 +45,7 @@ import openpi.models_pytorch.pi0_pytorch
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
+from openpi.models_pytorch.video_projector import create_video_align_projector
 
 
 def init_logging():
@@ -146,8 +147,13 @@ def get_model_parameters(model):
     )
 
 
-def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
-    """Save a checkpoint with model state, optimizer state, and metadata."""
+def save_checkpoint(model, optimizer, global_step, config, is_main, data_config, video_align_proj=None):
+    """Save a checkpoint with model state, optimizer state, and metadata.
+
+    If ``video_align_proj`` is provided, its weights are also saved to
+    ``video_projector.safetensors`` next to ``model.safetensors``. Old
+    checkpoints without this file remain loadable (see ``load_checkpoint``).
+    """
     if not is_main:
         return
 
@@ -165,6 +171,16 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
         # Save model state using safetensors (handle shared tensors)
         model_to_save = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
         safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / "model.safetensors")
+
+        # Save video projector state separately so it can be loaded independently
+        # (and so older checkpoints that lack it remain backward compatible).
+        if video_align_proj is not None:
+            proj_to_save = (
+                video_align_proj.module
+                if isinstance(video_align_proj, torch.nn.parallel.DistributedDataParallel)
+                else video_align_proj
+            )
+            safetensors.torch.save_model(proj_to_save, tmp_ckpt_dir / "video_projector.safetensors")
 
         # Save optimizer state using PyTorch format
         torch.save(optimizer.state_dict(), tmp_ckpt_dir / "optimizer.pt")
@@ -194,8 +210,15 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
             wandb.log({"checkpoint_step": global_step}, step=global_step)
 
 
-def load_checkpoint(model, optimizer, checkpoint_dir, device):
-    """Load the latest checkpoint and return the global step."""
+def load_checkpoint(model, optimizer, checkpoint_dir, device, video_align_proj=None):
+    """Load the latest checkpoint and return the global step.
+
+    If ``video_align_proj`` is provided AND a ``video_projector.safetensors``
+    file exists in the checkpoint, its weights are loaded. If the file is
+    missing (e.g. older checkpoints saved before this support was added),
+    the projector keeps its freshly initialized weights and a warning is
+    logged so resume continues to work.
+    """
     checkpoint_steps = [
         int(d.name)
         for d in checkpoint_dir.iterdir()
@@ -225,6 +248,25 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
             logging.info("Loaded model state from safetensors format")
         else:
             raise FileNotFoundError(f"No model checkpoint found at {ckpt_dir}")
+
+        # Load video projector state if available (backward compatible)
+        if video_align_proj is not None:
+            video_proj_path = ckpt_dir / "video_projector.safetensors"
+            if video_proj_path.exists():
+                proj_to_load = (
+                    video_align_proj.module
+                    if isinstance(video_align_proj, torch.nn.parallel.DistributedDataParallel)
+                    else video_align_proj
+                )
+                safetensors.torch.load_model(proj_to_load, video_proj_path, device=str(device))
+                logging.info("Loaded video_projector state from safetensors format")
+            else:
+                logging.warning(
+                    f"No video_projector.safetensors found at {ckpt_dir}. "
+                    "Resuming with freshly initialized video projector weights "
+                    "(this is expected for checkpoints saved before video_projector "
+                    "saving was enabled)."
+                )
 
         torch.cuda.empty_cache()
         gc.collect()
@@ -328,16 +370,22 @@ def train_loop(config: _config.TrainConfig):
                 raise FileNotFoundError(f"No valid checkpoints found in {exp_checkpoint_dir} for resume")
         else:
             raise FileNotFoundError(f"Experiment checkpoint directory {exp_checkpoint_dir} does not exist for resume")
-    elif config.overwrite and config.checkpoint_dir.exists():
+    elif config.overwrite and is_main and config.checkpoint_dir.exists():
         shutil.rmtree(config.checkpoint_dir)
         logging.info(f"Overwriting checkpoint directory: {config.checkpoint_dir}")
+
+    if use_ddp:
+        dist.barrier()
 
     # Create checkpoint directory with experiment name
     if not resuming:
         # For new runs, create experiment-specific checkpoint directory
         exp_checkpoint_dir = config.checkpoint_dir
-        exp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        logging.info(f"Created experiment checkpoint directory: {exp_checkpoint_dir}")
+        if is_main:
+            exp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            logging.info(f"Created experiment checkpoint directory: {exp_checkpoint_dir}")
+        if use_ddp:
+            dist.barrier()
     else:
         # For resume, checkpoint_dir is already set to the experiment directory
         logging.info(f"Using existing experiment checkpoint directory: {config.checkpoint_dir}")
@@ -448,6 +496,40 @@ def train_loop(config: _config.TrainConfig):
         )
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
+    # ── Video alignment (requires pre-computed VAE cache) ──────────────────
+    use_video_align = (
+        config.video_align_loss_coeff > 0
+        and config.video_cache_path is not None
+    )
+    video_align_proj = None
+
+    if use_video_align:
+        logging.info(f"Video alignment enabled (cache mode): coeff={config.video_align_loss_coeff}, mode={config.video_align_mode}")
+        _unwrapped_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+        vla_dim = _unwrapped_model.paligemma_with_expert.paligemma.config.text_config.hidden_size
+        delta_frames = getattr(getattr(config.data, "base_config", None), "video_delta_frames", None)
+        delta_frames_aux = getattr(getattr(config.data, "base_config", None), "video_delta_frames_aux", None)
+        video_image_keys = getattr(getattr(config.data, "base_config", None), "video_image_keys", None)
+        num_cameras = len(video_image_keys) if video_image_keys else 1
+        video_align_proj = create_video_align_projector(
+            config.video_align_mode, vla_dim, config.video_feat_dim,
+            video_delta_frames=delta_frames,
+            video_delta_frames_aux=delta_frames_aux,
+            use_vla_norm=config.use_vla_norm,
+            num_cameras=num_cameras,
+            loss_weight_primary=getattr(config, "video_loss_weight_primary", 1.0),
+            loss_weight_aux=getattr(config, "video_loss_weight_aux", 1.0),
+            contrast_weight=getattr(config, "video_contrast_weight", 0.1),
+            temperature=getattr(config, "video_contrast_temperature", 0.07),
+        ).to(device)
+
+        if use_ddp:
+            video_align_proj = torch.nn.parallel.DistributedDataParallel(
+                video_align_proj,
+                device_ids=[device.index] if device.type == "cuda" else None,
+                gradient_as_bucket_view=True,
+            )
+
     # Optimizer + learning rate schedule from config
     warmup_steps = config.lr_schedule.warmup_steps
     peak_lr = config.lr_schedule.peak_lr
@@ -455,8 +537,12 @@ def train_loop(config: _config.TrainConfig):
     end_lr = config.lr_schedule.decay_lr
 
     # Create optimizer with config parameters
+    optim_params = list(model.parameters())
+    if video_align_proj is not None:
+        optim_params += list(video_align_proj.parameters())
+
     optim = torch.optim.AdamW(
-        model.parameters(),
+        optim_params,
         lr=peak_lr,
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,
@@ -466,7 +552,9 @@ def train_loop(config: _config.TrainConfig):
     # Load checkpoint if resuming
     global_step = 0
     if resuming:
-        global_step = load_checkpoint(model, optim, config.checkpoint_dir, device)
+        global_step = load_checkpoint(
+            model, optim, config.checkpoint_dir, device, video_align_proj=video_align_proj
+        )
         logging.info(f"Resumed training from step {global_step}")
 
     def lr_schedule(step: int):
@@ -480,6 +568,8 @@ def train_loop(config: _config.TrainConfig):
         return end_lr + (peak_lr - end_lr) * cos
 
     model.train()
+    if video_align_proj is not None:
+        video_align_proj.train()
     start_time = time.time()
     infos = []  # Collect stats over log interval
     if is_main:
@@ -490,6 +580,8 @@ def train_loop(config: _config.TrainConfig):
             f"Training config: batch_size={config.batch_size}, effective_batch_size={effective_batch_size}, num_train_steps={config.num_train_steps}"
         )
         logging.info(f"Memory optimizations: gradient_checkpointing={enable_gradient_checkpointing}")
+        if use_video_align:
+            logging.info(f"Video align loss coeff={config.video_align_loss_coeff}, layer={config.vla_align_layer}, spatial_pe={config.use_spatial_pe}, vla_norm={config.use_vla_norm}")
         logging.info(
             f"LR schedule: warmup={warmup_steps}, peak_lr={peak_lr:.2e}, decay_steps={decay_steps}, end_lr={end_lr:.2e}"
         )
@@ -526,14 +618,24 @@ def train_loop(config: _config.TrainConfig):
                 pg["lr"] = lr_schedule(global_step)
 
             # Forward pass
-            losses = model(observation, actions)
-            # Ensure losses is a tensor and handle different return types
-            if isinstance(losses, list | tuple):
-                losses = torch.stack(losses)
-            elif not isinstance(losses, torch.Tensor):
-                losses = torch.tensor(losses, device=device, dtype=torch.float32)
+            result = model(observation, actions,
+                           video_align_proj=video_align_proj,
+                           vla_align_layer=config.vla_align_layer,
+                           use_spatial_pe=config.use_spatial_pe,
+                           video_cache_layout=config.video_cache_layout)
 
-            loss = losses.mean()
+            video_align_loss_val = 0.0
+            if isinstance(result, tuple):
+                action_losses, video_align_loss = result
+                loss = action_losses.mean() + config.video_align_loss_coeff * video_align_loss
+                video_align_loss_val = video_align_loss.item()
+            else:
+                action_losses = result
+                if isinstance(action_losses, list | tuple):
+                    action_losses = torch.stack(action_losses)
+                elif not isinstance(action_losses, torch.Tensor):
+                    action_losses = torch.tensor(action_losses, device=device, dtype=torch.float32)
+                loss = action_losses.mean()
 
             # Backward pass
             loss.backward()
@@ -543,7 +645,10 @@ def train_loop(config: _config.TrainConfig):
                 log_memory_usage(device, global_step, "after_backward")
 
             # Gradient clipping
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
+            clip_params = list(model.parameters())
+            if video_align_proj is not None:
+                clip_params += list(video_align_proj.parameters())
+            grad_norm = torch.nn.utils.clip_grad_norm_(clip_params, max_norm=config.optimizer.clip_gradient_norm)
 
             # Optimizer step
             optim.step()
@@ -557,19 +662,27 @@ def train_loop(config: _config.TrainConfig):
 
             # Collect stats
             if is_main:
-                infos.append(
-                    {
-                        "loss": loss.item(),
-                        "learning_rate": optim.param_groups[0]["lr"],
-                        "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
-                    }
-                )
+                info = {
+                    "loss": loss.item(),
+                    "action_loss": action_losses.mean().item(),
+                    "learning_rate": optim.param_groups[0]["lr"],
+                    "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                }
+                if use_video_align:
+                    info["video_align_loss"] = video_align_loss_val
+                    _proj = video_align_proj.module if hasattr(video_align_proj, "module") else video_align_proj
+                    if hasattr(_proj, "_last_frame_loss"):
+                        info["frame_loss"] = _proj._last_frame_loss.item()
+                    if hasattr(_proj, "_last_contrast_loss"):
+                        info["contrast_loss"] = _proj._last_contrast_loss.item()
+                infos.append(info)
 
             if is_main and (global_step % config.log_interval == 0):
                 elapsed = time.time() - start_time
 
                 # Average stats over log interval
                 avg_loss = sum(info["loss"] for info in infos) / len(infos)
+                avg_action = sum(info["action_loss"] for info in infos) / len(infos)
                 avg_lr = sum(info["learning_rate"] for info in infos) / len(infos)
 
                 avg_grad_norm = None
@@ -579,20 +692,38 @@ def train_loop(config: _config.TrainConfig):
                     ]
                     if len(vals) > 0:
                         avg_grad_norm = sum(vals) / len(vals)
-                logging.info(
-                    f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
-                    if avg_grad_norm is not None
-                    else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
-                )
+
+                parts = [f"step={global_step}", f"loss={avg_loss:.6f}", f"action={avg_action:.6f}"]
+                if use_video_align:
+                    avg_valign = sum(info.get("video_align_loss", 0) for info in infos) / len(infos)
+                    scaled_valign = config.video_align_loss_coeff * avg_valign
+                    parts.append(f"v_align={avg_valign:.4f}")
+                    parts.append(f"v_align_scaled={scaled_valign:.6f}")
+                    if any("frame_loss" in info for info in infos):
+                        avg_frame = sum(info.get("frame_loss", 0) for info in infos) / len(infos)
+                        avg_contrast = sum(info.get("contrast_loss", 0) for info in infos) / len(infos)
+                        parts.append(f"frame={avg_frame:.4f}")
+                        parts.append(f"contrast={avg_contrast:.4f}")
+                parts.append(f"lr={avg_lr:.2e}")
+                if avg_grad_norm is not None:
+                    parts.append(f"grad_norm={avg_grad_norm:.2f}")
+                parts.append(f"time={elapsed:.1f}s")
+                logging.info(" ".join(parts))
 
                 # Log to wandb
                 if config.wandb_enabled and len(infos) > 0:
                     log_payload = {
                         "loss": avg_loss,
+                        "action_loss": avg_action,
                         "learning_rate": avg_lr,
                         "step": global_step,
                         "time_per_step": elapsed / config.log_interval,
                     }
+                    if use_video_align:
+                        log_payload["video_align_loss"] = avg_valign
+                        if any("frame_loss" in info for info in infos):
+                            log_payload["frame_loss"] = sum(info.get("frame_loss", 0) for info in infos) / len(infos)
+                            log_payload["contrast_loss"] = sum(info.get("contrast_loss", 0) for info in infos) / len(infos)
                     if avg_grad_norm is not None:
                         log_payload["grad_norm"] = avg_grad_norm
                     wandb.log(log_payload, step=global_step)
@@ -602,7 +733,10 @@ def train_loop(config: _config.TrainConfig):
 
             global_step += 1
             # Save checkpoint using the new mechanism
-            save_checkpoint(model, optim, global_step, config, is_main, data_config)
+            save_checkpoint(
+                model, optim, global_step, config, is_main, data_config,
+                video_align_proj=video_align_proj,
+            )
 
             # Update progress bar
             if pbar is not None:

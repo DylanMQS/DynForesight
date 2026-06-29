@@ -66,6 +66,27 @@ class Policy(BasePolicy):
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+        # Strip optional rollout metadata (used only by attention visualization
+        # in PyTorch models). These keys, if present, are forwarded directly to
+        # the model and removed from the observation dict before transforms so
+        # they don't interfere with image/state processing.
+        rollout_meta: dict[str, Any] = {}
+        if isinstance(obs, dict):
+            for k in (
+                "__rollout_task_id__",
+                "__rollout_episode_id__",
+                "__rollout_step__",
+                "__rollout_task_name__",
+            ):
+                if k in obs:
+                    rollout_meta[k.strip("_").replace("rollout_", "")] = obs.pop(k)
+        if (
+            rollout_meta
+            and self._is_pytorch_model
+            and hasattr(self._model, "set_rollout_context")
+        ):
+            self._model.set_rollout_context(**rollout_meta)
+
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)

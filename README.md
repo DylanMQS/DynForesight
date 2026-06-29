@@ -45,15 +45,15 @@ git submodule update --init --recursive
 We use [uv](https://docs.astral.sh/uv/) to manage Python dependencies. See the [uv installation instructions](https://docs.astral.sh/uv/getting-started/installation/) to set it up. Once uv is installed, run the following to set up the environment:
 
 ```bash
-GIT_LFS_SKIP_SMUDGE=1 uv sync
-GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
+UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ GIT_LFS_SKIP_SMUDGE=1 uv sync
+UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
 ```
 
 NOTE: `GIT_LFS_SKIP_SMUDGE=1` is needed to pull LeRobot as a dependency.
 
 **Docker**: As an alternative to uv installation, we provide instructions for installing openpi using Docker. If you encounter issues with your system setup, consider using Docker to simplify installation. See [Docker Setup](docs/docker.md) for more details.
 
-
+±
 
 
 ## Model Checkpoints
@@ -94,8 +94,8 @@ from openpi.training import config as _config
 from openpi.policies import policy_config
 from openpi.shared import download
 
-config = _config.get_config("pi05_droid")
-checkpoint_dir = download.maybe_download("gs://openpi-assets/checkpoints/pi05_droid")
+config = _config.get_config("pi05_libero")
+checkpoint_dir = download.maybe_download("gs://openpi-assets/checkpoints/pi05_base")
 
 # Create a trained policy.
 policy = policy_config.create_trained_policy(config, checkpoint_dir)

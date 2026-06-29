@@ -1,0 +1,270 @@
+{
+  "overall": {
+    "total_count": 10030,
+    "success_count": 7215,
+    "success_rate": 0.7193419740777667
+  },
+  "per_category": {
+    "Camera Viewpoints": {
+      "total_count": 1599,
+      "success_count": 752,
+      "success_rate": 0.47029393370856787,
+      "macro_success_rate": 0.47221740507491117,
+      "num_suites": 4,
+      "per_suite_success_rate": {
+        "libero_10": 0.3627684964200477,
+        "libero_goal": 0.4852941176470588,
+        "libero_object": 0.5328282828282829,
+        "libero_spatial": 0.5079787234042553
+      }
+    },
+    "Robot Initial States": {
+      "total_count": 1550,
+      "success_count": 942,
+      "success_rate": 0.607741935483871,
+      "macro_success_rate": 0.6098299490589919,
+      "num_suites": 4,
+      "per_suite_success_rate": {
+        "libero_10": 0.5801526717557252,
+        "libero_goal": 0.6332518337408313,
+        "libero_object": 0.5402010050251256,
+        "libero_spatial": 0.6857142857142857
+      }
+    },
+    "Language Instructions": {
+      "total_count": 1537,
+      "success_count": 1144,
+      "success_rate": 0.7443070917371503,
+      "macro_success_rate": 0.7464019247381652,
+      "num_suites": 4,
+      "per_suite_success_rate": {
+        "libero_10": 0.7180156657963447,
+        "libero_goal": 0.6658536585365854,
+        "libero_object": 0.7966101694915254,
+        "libero_spatial": 0.8051282051282052
+      }
+    },
+    "Light Conditions": {
+      "total_count": 1142,
+      "success_count": 1067,
+      "success_rate": 0.9343257443082311,
+      "macro_success_rate": 0.933988766188006,
+      "num_suites": 4,
+      "per_suite_success_rate": {
+        "libero_10": 0.8868613138686131,
+        "libero_goal": 0.982078853046595,
+        "libero_object": 0.9663299663299664,
+        "libero_spatial": 0.9006849315068494
+      }
+    },
+    "Background Textures": {
+      "total_count": 1076,
+      "success_count": 974,
+      "success_rate": 0.9052044609665427,
+      "macro_success_rate": 0.9080023222043859,
+      "num_suites": 4,
+      "per_suite_success_rate": {
+        "libero_10": 0.8200692041522492,
+        "libero_goal": 0.9145907473309609,
+        "libero_object": 0.9516129032258065,
+        "libero_spatial": 0.9457364341085271
+      }
+    },
+    "Sensor Noise": {
+      "total_count": 1601,
+      "success_count": 1047,
+      "success_rate": 0.6539662710805746,
+      "macro_success_rate": 0.6580359813070799,
+      "num_suites": 4,
+      "per_suite_success_rate": {
+        "libero_10": 0.5167037861915368,
+        "libero_goal": 0.5936675461741425,
+        "libero_object": 0.7867298578199052,
+        "libero_spatial": 0.7350427350427351
+      }
+    },
+    "Objects Layout": {
+      "total_count": 1525,
+      "success_count": 1289,
+      "success_rate": 0.8452459016393442,
+      "macro_success_rate": 0.8501681762260511,
+      "num_suites": 4,
+      "per_suite_success_rate": {
+        "libero_10": 0.8653846153846154,
+        "libero_goal": 0.6541176470588236,
+        "libero_object": 0.9305210918114144,
+        "libero_spatial": 0.9506493506493506
+      }
+    }
+  },
+  "per_suite": {
+    "libero_10": {
+      "overall": {
+        "total_count": 2519,
+        "success_count": 1637,
+        "success_rate": 0.6498610559745931
+      },
+      "Background Textures": {
+        "total_count": 289,
+        "success_count": 237,
+        "success_rate": 0.8200692041522492
+      },
+      "Robot Initial States": {
+        "total_count": 393,
+        "success_count": 228,
+        "success_rate": 0.5801526717557252
+      },
+      "Camera Viewpoints": {
+        "total_count": 419,
+        "success_count": 152,
+        "success_rate": 0.3627684964200477
+      },
+      "Language Instructions": {
+        "total_count": 383,
+        "success_count": 275,
+        "success_rate": 0.7180156657963447
+      },
+      "Sensor Noise": {
+        "total_count": 449,
+        "success_count": 232,
+        "success_rate": 0.5167037861915368
+      },
+      "Objects Layout": {
+        "total_count": 312,
+        "success_count": 270,
+        "success_rate": 0.8653846153846154
+      },
+      "Light Conditions": {
+        "total_count": 274,
+        "success_count": 243,
+        "success_rate": 0.8868613138686131
+      }
+    },
+    "libero_goal": {
+      "overall": {
+        "total_count": 2591,
+        "success_count": 1764,
+        "success_rate": 0.68081821690467
+      },
+      "Background Textures": {
+        "total_count": 281,
+        "success_count": 257,
+        "success_rate": 0.9145907473309609
+      },
+      "Robot Initial States": {
+        "total_count": 409,
+        "success_count": 259,
+        "success_rate": 0.6332518337408313
+      },
+      "Camera Viewpoints": {
+        "total_count": 408,
+        "success_count": 198,
+        "success_rate": 0.4852941176470588
+      },
+      "Language Instructions": {
+        "total_count": 410,
+        "success_count": 273,
+        "success_rate": 0.6658536585365854
+      },
+      "Sensor Noise": {
+        "total_count": 379,
+        "success_count": 225,
+        "success_rate": 0.5936675461741425
+      },
+      "Objects Layout": {
+        "total_count": 425,
+        "success_count": 278,
+        "success_rate": 0.6541176470588236
+      },
+      "Light Conditions": {
+        "total_count": 279,
+        "success_count": 274,
+        "success_rate": 0.982078853046595
+      }
+    },
+    "libero_object": {
+      "overall": {
+        "total_count": 2518,
+        "success_count": 1938,
+        "success_rate": 0.7696584590945195
+      },
+      "Background Textures": {
+        "total_count": 248,
+        "success_count": 236,
+        "success_rate": 0.9516129032258065
+      },
+      "Robot Initial States": {
+        "total_count": 398,
+        "success_count": 215,
+        "success_rate": 0.5402010050251256
+      },
+      "Camera Viewpoints": {
+        "total_count": 396,
+        "success_count": 211,
+        "success_rate": 0.5328282828282829
+      },
+      "Language Instructions": {
+        "total_count": 354,
+        "success_count": 282,
+        "success_rate": 0.7966101694915254
+      },
+      "Sensor Noise": {
+        "total_count": 422,
+        "success_count": 332,
+        "success_rate": 0.7867298578199052
+      },
+      "Objects Layout": {
+        "total_count": 403,
+        "success_count": 375,
+        "success_rate": 0.9305210918114144
+      },
+      "Light Conditions": {
+        "total_count": 297,
+        "success_count": 287,
+        "success_rate": 0.9663299663299664
+      }
+    },
+    "libero_spatial": {
+      "overall": {
+        "total_count": 2402,
+        "success_count": 1876,
+        "success_rate": 0.7810158201498751
+      },
+      "Background Textures": {
+        "total_count": 258,
+        "success_count": 244,
+        "success_rate": 0.9457364341085271
+      },
+      "Robot Initial States": {
+        "total_count": 350,
+        "success_count": 240,
+        "success_rate": 0.6857142857142857
+      },
+      "Camera Viewpoints": {
+        "total_count": 376,
+        "success_count": 191,
+        "success_rate": 0.5079787234042553
+      },
+      "Language Instructions": {
+        "total_count": 390,
+        "success_count": 314,
+        "success_rate": 0.8051282051282052
+      },
+      "Sensor Noise": {
+        "total_count": 351,
+        "success_count": 258,
+        "success_rate": 0.7350427350427351
+      },
+      "Objects Layout": {
+        "total_count": 385,
+        "success_count": 366,
+        "success_rate": 0.9506493506493506
+      },
+      "Light Conditions": {
+        "total_count": 292,
+        "success_count": 263,
+        "success_rate": 0.9006849315068494
+      }
+    }
+  }
+}

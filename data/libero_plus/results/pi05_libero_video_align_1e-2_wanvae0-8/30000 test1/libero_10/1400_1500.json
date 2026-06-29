@@ -1,0 +1,30 @@
+{
+  "Background Textures": {
+    "total_count": 0,
+    "success_count": 0
+  },
+  "Robot Initial States": {
+    "total_count": 0,
+    "success_count": 0
+  },
+  "Camera Viewpoints": {
+    "total_count": 0,
+    "success_count": 0
+  },
+  "Language Instructions": {
+    "total_count": 84,
+    "success_count": 52
+  },
+  "Sensor Noise": {
+    "total_count": 16,
+    "success_count": 14
+  },
+  "Objects Layout": {
+    "total_count": 0,
+    "success_count": 0
+  },
+  "Light Conditions": {
+    "total_count": 0,
+    "success_count": 0
+  }
+}

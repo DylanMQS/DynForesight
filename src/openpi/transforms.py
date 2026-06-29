@@ -337,6 +337,111 @@ class PadStatesAndActions(DataTransformFn):
         return data
 
 
+class LookupVaeCache:
+    """Wrap a fully-transformed dataset to inject pre-computed VAE features by sample index.
+
+    Must wrap the *final* transformed dataset (after all repack / data / model transforms)
+    so that the injected ``vae_cache`` entry cannot be dropped by intermediate transforms.
+
+    The cache is consolidated into a single shared-memory tensor so DataLoader workers
+    (spawn mode) inherit it via fd without pickling/mmap of the original dict.
+    """
+
+    def __init__(self, dataset, cache: dict, key: str = "vae_cache"):
+        import torch
+
+        self._dataset = dataset
+        self._key = key
+
+        keys = sorted(cache.keys())
+        sample_val = cache[keys[0]]
+        cam_names = list(sample_val.keys())
+        sample_shape = sample_val[cam_names[0]].shape
+        dtype = sample_val[cam_names[0]].dtype
+
+        n = len(keys)
+        n_cams = len(cam_names)
+        all_feats = torch.empty(n, n_cams, *sample_shape, dtype=dtype)
+        all_feats.share_memory_()
+
+        for i, k in enumerate(keys):
+            per_cam = cache[k]
+            for j, c in enumerate(cam_names):
+                all_feats[i, j].copy_(per_cam[c])
+
+        self._all_feats = all_feats
+        self._key_to_pos = {k: i for i, k in enumerate(keys)}
+
+    def __getitem__(self, index):
+        data = self._dataset[index]
+        idx = int(index) if not hasattr(index, "__index__") else index.__index__()
+        pos = self._key_to_pos.get(idx)
+        if pos is not None:
+            data[self._key] = self._all_feats[pos].numpy()
+        return data
+
+    def __len__(self):
+        return len(self._dataset)
+
+
+class MmapVaeCache:
+    """Like LookupVaeCache but backed by a numpy memory-mapped file.
+
+    Expects two files produced by ``scripts/convert_cache_to_mmap.py``:
+
+    - ``<prefix>.mmap``   — flat binary of shape ``(N, n_cams, C, T, H, W)``
+    - ``<prefix>.meta.pt`` — metadata dict with ``shape``, ``dtype``, ``key_to_pos``
+
+    Only the pages actually accessed during training are loaded into RAM
+    (managed by the OS page cache), making this suitable for TB-scale caches.
+
+    Safe for DataLoader ``spawn`` mode: custom pickle protocol re-opens the
+    mmap in each worker instead of serializing the full array.
+    """
+
+    def __init__(self, dataset, mmap_prefix: str, key: str = "vae_cache"):
+        import numpy as np
+        import torch
+
+        self._dataset = dataset
+        self._key = key
+
+        meta_path = mmap_prefix + ".meta.pt"
+        self._mmap_path = mmap_prefix + ".mmap"
+
+        meta = torch.load(meta_path, map_location="cpu", weights_only=False)
+        self._mmap_shape = tuple(meta["shape"])
+        self._mmap_dtype = np.dtype(meta["dtype"])
+        self._key_to_pos = meta["key_to_pos"]
+
+        self._mmap = np.memmap(
+            self._mmap_path, dtype=self._mmap_dtype, mode="r", shape=self._mmap_shape,
+        )
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        del state["_mmap"]
+        return state
+
+    def __setstate__(self, state):
+        import numpy as np
+        self.__dict__.update(state)
+        self._mmap = np.memmap(
+            self._mmap_path, dtype=self._mmap_dtype, mode="r", shape=self._mmap_shape,
+        )
+
+    def __getitem__(self, index):
+        data = self._dataset[index]
+        idx = int(index) if not hasattr(index, "__index__") else index.__index__()
+        pos = self._key_to_pos.get(idx)
+        if pos is not None:
+            data[self._key] = self._mmap[pos].copy()
+        return data
+
+    def __len__(self):
+        return len(self._dataset)
+
+
 def flatten_dict(tree: at.PyTree) -> dict:
     """Flatten a nested dictionary. Uses '/' as the separator."""
     return traverse_util.flatten_dict(tree, sep="/")

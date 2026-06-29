@@ -96,9 +96,28 @@ class PaliGemmaWithExpertModel(nn.Module):
         inputs_embeds: list[torch.FloatTensor] | None = None,
         use_cache: bool | None = None,
         adarms_cond: list[torch.Tensor] | None = None,
+        return_prefix_at_layer: int | None = None,
+        attn_collector: dict | None = None,
     ):
+        """Run a joint paligemma / action-expert forward.
+
+        ``attn_collector`` (optional, inference-only): a dict with key
+        ``"layers"`` (an iterable of layer indices, or ``None`` for all
+        layers). Captured attention weights are stored back into the dict under
+        keys ``"prefix"`` and/or ``"suffix"`` as ``{layer_idx: tensor}``. This
+        only collects attention from the prefix-only and suffix-only branches
+        (i.e. the standard inference path that uses HuggingFace's GemmaModel).
+        The joint-training branch below is not instrumented.
+        """
         if adarms_cond is None:
             adarms_cond = [None, None]
+        intermediate_prefix_hidden = None
+        capture_attn = attn_collector is not None
+        wanted_layers = None
+        if capture_attn:
+            wanted_layers = attn_collector.get("layers")
+            if wanted_layers is not None:
+                wanted_layers = set(int(x) for x in wanted_layers)
         if inputs_embeds[1] is None:
             prefix_output = self.paligemma.language_model.forward(
                 inputs_embeds=inputs_embeds[0],
@@ -107,7 +126,13 @@ class PaliGemmaWithExpertModel(nn.Module):
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 adarms_cond=adarms_cond[0] if adarms_cond is not None else None,
+                output_attentions=capture_attn,
             )
+            if capture_attn and prefix_output.attentions is not None:
+                bucket = attn_collector.setdefault("prefix", {})
+                for li, w in enumerate(prefix_output.attentions):
+                    if wanted_layers is None or li in wanted_layers:
+                        bucket[li] = w.detach()
             prefix_past_key_values = prefix_output.past_key_values
             prefix_output = prefix_output.last_hidden_state
             suffix_output = None
@@ -119,7 +144,13 @@ class PaliGemmaWithExpertModel(nn.Module):
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 adarms_cond=adarms_cond[1] if adarms_cond is not None else None,
+                output_attentions=capture_attn,
             )
+            if capture_attn and suffix_output.attentions is not None:
+                bucket = attn_collector.setdefault("suffix", {})
+                for li, w in enumerate(suffix_output.attentions):
+                    if wanted_layers is None or li in wanted_layers:
+                        bucket[li] = w.detach()
             suffix_output = suffix_output.last_hidden_state
             prefix_output = None
             prefix_past_key_values = None
@@ -238,6 +269,7 @@ class PaliGemmaWithExpertModel(nn.Module):
                 return outputs_embeds
 
             # Process all layers with gradient checkpointing if enabled
+            intermediate_prefix_hidden = None
             for layer_idx in range(num_layers):
                 if use_gradient_checkpointing:
                     inputs_embeds = torch.utils.checkpoint.checkpoint(
@@ -254,6 +286,9 @@ class PaliGemmaWithExpertModel(nn.Module):
                     inputs_embeds = compute_layer_complete(
                         layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond
                     )
+
+                if return_prefix_at_layer is not None and layer_idx == return_prefix_at_layer:
+                    intermediate_prefix_hidden = inputs_embeds[0]
 
                 # Old code removed - now using compute_layer_complete function above
 
@@ -278,4 +313,4 @@ class PaliGemmaWithExpertModel(nn.Module):
             suffix_output = outputs_embeds[1]
             prefix_past_key_values = None
 
-        return [prefix_output, suffix_output], prefix_past_key_values
+        return [prefix_output, suffix_output], prefix_past_key_values, intermediate_prefix_hidden

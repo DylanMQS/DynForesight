@@ -97,6 +97,17 @@ class DataConfig:
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
 
+    # Video temporal frames for video feature alignment.
+    # Frame offsets relative to the current frame (e.g. [-4, -3, -2, -1, 0] loads 5 frames).
+    # Must include 0 (the current frame). None means no video frames are loaded.
+    video_delta_frames: list[int] | None = None
+    # Optional second group of delta frames for dual-head alignment.
+    # When set, a second VAE cache (video_cache_path_aux) is loaded and fitted independently
+    # by a separate projector head. None means single-group mode (default).
+    video_delta_frames_aux: list[int] | None = None
+    # LeRobot image column names to load temporally (e.g. ("observation.images.cam_high",)).
+    video_image_keys: Sequence[str] | None = None
+
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -485,6 +496,33 @@ class TrainConfig:
     # Precision for PyTorch training.
     pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
 
+    # Video temporal alignment configs (all default to disabled).
+    video_cache_path: str | None = None
+    # Optional second VAE cache for dual-head alignment (independent fitting).
+    video_cache_path_aux: str | None = None
+    video_feat_dim: int = 48
+    video_align_loss_coeff: float = 0.0
+    video_align_mode: str = "mean"
+    vla_align_layer: int = -1
+    use_spatial_pe: bool = False
+    use_vla_norm: bool = True
+    # Per-head loss weights for dual-head modes (ignored in single-head modes).
+    video_loss_weight_primary: float = 1.0
+    video_loss_weight_aux: float = 1.0
+    video_contrast_weight: float = 0.1
+    video_contrast_temperature: float = 0.07
+    # When True, video_cache_path is treated as a mmap prefix (<path>.mmap + <path>.meta.pt)
+    # instead of a .pt file. Use for TB-scale caches to avoid loading into RAM.
+    mmap_video_cache: bool = False
+    # Dimension ordering of per-camera features in the cache.
+    # "CTHW" (default): channel-first layout [C, T, H, W].
+    # "TCHW": time-first layout [T, C, H, W] (e.g. wandit features).
+    video_cache_layout: str = "CTHW"
+    # 一共18层，-1表示最后一层经过final norm的输出
+    # 0 提取第 0 层（最底层）的 hidden state 做 align
+    # 1 ~ 16 提取对应中间层的 hidden state 做 align
+    # 17 提取第 17 层（最后一层，但未经 final norm）的 hidden state 做 align
+
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
     optimizer: _optimizer.OptimizerConfig = dataclasses.field(default_factory=_optimizer.AdamW)
     ema_decay: float | None = 0.99
@@ -648,33 +686,3754 @@ _CONFIGS = [
     # are using, and other hyperparameters like how many training steps to run or what learning rate to use.
     # For your own dataset, you can copy this class and modify the dataset name, and data transforms based on
     # the comments below.
+
     TrainConfig(
-        # Change the name to reflect your model and dataset.
-        name="pi0_libero",
-        # Here you define the model config -- In this example we use pi0 as the model
-        # architecture and perform *full* finetuning. in the examples below we show how to modify
-        # this to perform *low-memory* (LORA) finetuning and use pi0-FAST as an alternative architecture.
-        model=pi0_config.Pi0Config(),
-        # Here you define the dataset you are training on. In this example we use the Libero
-        # dataset. For your own dataset, you can change the repo_id to point to your dataset.
-        # Also modify the DataConfig to use the new config you made for your dataset above.
+        name="pi0_libero_continue_train",
+        model=pi0_config.Pi0Config(action_horizon=30),
         data=LeRobotLiberoDataConfig(
-            repo_id="physical-intelligence/libero",
+            repo_id="lerobot_all_repo",
             base_config=DataConfig(
-                # This flag determines whether we load the prompt (i.e. the task instruction) from the
-                # ``task`` field in the LeRobot dataset. If set to True, the prompt will show up in
-                # a field called ``prompt`` in the input dict. The recommended setting is True.
                 prompt_from_task=True,
             ),
             extra_delta_transform=True,
         ),
-        # Here you define which pre-trained checkpoint you want to load to initialize the model.
-        # This should match the model config you chose above -- i.e. in this case we use the pi0 base model.
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        # Below you can define other hyperparameters like the learning rate, number of training steps, etc.
-        # Check the base TrainConfig class for a full list of available hyperparameters.
-        num_train_steps=30_000,
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),  # New Add
+        num_train_steps=30_000_000,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        save_interval=5_000_000,
     ),
+    
+    
+    TrainConfig(
+        name="pi0_libero",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            extra_delta_transform=True,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),  # New Add
+        num_train_steps=30_000,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        save_interval=5_000,
+    ),
+    
+    
+    TrainConfig(
+        name="pi0_libero_1pct",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo_shuffled_1pct",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            extra_delta_transform=True,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),  # New Add
+        num_train_steps=30_000,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        save_interval=5_000,
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_5pct",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo_shuffled_5pct",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            extra_delta_transform=True,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),  # New Add
+        num_train_steps=30_000,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        save_interval=5_000,
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_25pct",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo_shuffled_25pct",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            extra_delta_transform=True,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),  # New Add
+        num_train_steps=30_000,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        save_interval=5_000,
+    ),
+
+
+    TrainConfig(
+        name="pi0_libero_1pct_video_layer11_5e-1_wanvae0-8_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo_shuffled_1pct",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo_shuffled_1pct/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        save_interval=5_000,
+    ),
+    
+
+
+
+
+    TrainConfig(
+        name="pi0_libero_5pct_video_layer11_5e-1_wanvae0-8_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo_shuffled_5pct",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo_shuffled_5pct/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        save_interval=5_000,
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_25pct_video_layer11_5e-1_wanvae0-8_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo_shuffled_25pct",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo_shuffled_25pct/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        save_interval=5_000,
+    ),
+    
+    
+    TrainConfig(
+        name="pi0_libero_video_layer-1_1e-2_wanvae0-8",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=1e-2,
+        vla_align_layer=-1,
+    ),
+    
+    
+    TrainConfig(
+        name="pi0_libero_video_layer-1_1e-1_wanvae0-8",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=1e-1,
+        vla_align_layer=-1,
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_1e-2_wanvae0-8_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=1e-2,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat"
+    ),
+    
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_1e-1_wanvae0-8_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=1e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat"
+    ),
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wanvae-8-0with0-8_dual_head_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_delta_frames_aux=[-8, -7, -6, -5, -4, -3, -2, -1, 0],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_cache_path_aux="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f-8_-7_-6_-5_-4_-3_-2_-1_0.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="dual_head_concat",
+        video_loss_weight_primary=1.0,
+        video_loss_weight_aux=1.0,
+    ),
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wanvae-4-0with0-8_dual_head_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_delta_frames_aux=[-4, -3, -2, -1, 0],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_cache_path_aux="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f-4_-3_-2_-1_0.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="dual_head_concat",
+        video_loss_weight_primary=1.0,
+        video_loss_weight_aux=1.0,
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wanvae-8-0with0-4_dual_head_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4],
+                video_delta_frames_aux=[-8, -7, -6, -5, -4, -3, -2, -1, 0],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4.pt",
+        video_cache_path_aux="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f-8_-7_-6_-5_-4_-3_-2_-1_0.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="dual_head_concat",
+        video_loss_weight_primary=1.0,
+        video_loss_weight_aux=1.0,
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wanvae-4-0with0-4_dual_head_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4],
+                video_delta_frames_aux=[-4, -3, -2, -1, 0],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4.pt",
+        video_cache_path_aux="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f-4_-3_-2_-1_0.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="dual_head_concat",
+        video_loss_weight_primary=1.0,
+        video_loss_weight_aux=1.0,
+    ),
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wanvae0-8_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat"
+    ),
+    
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wanvae0-12_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8_9_10_11_12.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        save_interval=5000,
+    ),
+    
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wanvae0-16_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8_9_10_11_12_13_14_15_16.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        save_interval=15000,
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wanvae0-16_multi_frame_concat_visual",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8_9_10_11_12_13_14_15_16.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        save_interval=15000,
+    ),
+    
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wanvae-16-0_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[-16, -15, -14, -13, -12, -11, -10, -9, -8, -7, -6, -5, -4, -3, -2, -1, 0],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f-16_-15_-14_-13_-12_-11_-10_-9_-8_-7_-6_-5_-4_-3_-2_-1_0.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        save_interval=15000,
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wanvae-8-8_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[-8,-7,-6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f-8_-7_-6_-5_-4_-3_-2_-1_0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        save_interval=15000,
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wanvae-4-4_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[-4, -3, -2, -1, 0, 1, 2, 3, 4],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f-4_-3_-2_-1_0_1_2_3_4.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        save_interval=15000,
+    ),    
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wanvae-8-0_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[-8, -7, -6, -5, -4, -3, -2, -1, 0],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f-8_-7_-6_-5_-4_-3_-2_-1_0.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        save_interval=15000,
+    ),
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wanvae0-4_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        save_interval=5000,
+    ),
+    
+
+    
+
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wandit0-8layer11_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/wandit_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk11_t300",
+        video_feat_dim=3072,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wandit0-8layer13_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/backup/wandit_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk13_t300",
+        video_feat_dim=3072,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wandit0-8layer17_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/backup/wandit_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk17_t300",
+        video_feat_dim=3072,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wandit0-8layer21_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/backup/wandit_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk21_t300",
+        video_feat_dim=3072,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wandit0-8layer25_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/backup/wandit_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk25_t300",
+        video_feat_dim=3072,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wan21dit0-8layer3_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/backup/wan21dit_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk3_t300",
+        video_feat_dim=1536,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wan21dit0-8layer5_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/backup/wan21dit_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk5_t300",
+        video_feat_dim=1536,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wan21dit0-8layer7_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/backup/wan21dit_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk7_t300",
+        video_feat_dim=1536,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wan21dit0-8layer9_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/backup/wan21dit_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk9_t300",
+        video_feat_dim=1536,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wan21dit0-8layer11_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/backup/wan21dit_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk11_t300",
+        video_feat_dim=1536,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wan21dit0-8layer13_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/backup/wan21dit_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk13_t300",
+        video_feat_dim=1536,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wan21dit0-8layer15_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/backup/wan21dit_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk15_t300",
+        video_feat_dim=1536,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wan21dit0-8layer17_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/backup/wan21dit_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk17_t300",
+        video_feat_dim=1536,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wan21dit0-8layer19_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/backup/wan21dit_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk19_t300",
+        video_feat_dim=1536,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wan21dit0-8layer21_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/backup/wan21dit_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk21_t300",
+        video_feat_dim=1536,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wan21dit0-8layer23_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/backup/wan21dit_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk23_t300",
+        video_feat_dim=1536,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wan21dit0-8layer25_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/backup/wan21dit_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk25_t300",
+        video_feat_dim=1536,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wan21dit0-8layer27_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/backup/wan21dit_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk27_t300",
+        video_feat_dim=1536,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wandit0-8layer15_timestep0_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/backup/wandit_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk15_t0",
+        video_feat_dim=3072,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wandit0-8layer15_timestep50_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/backup/wandit_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk15_t50",
+        video_feat_dim=3072,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wandit0-8layer15_timestep100_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/backup/wandit_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk15_t100",
+        video_feat_dim=3072,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wandit0-8layer15_timestep200_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/backup/wandit_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk15_t200",
+        video_feat_dim=3072,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wandit0-8layer15_timestep400_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/wandit_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk15_t400",
+        video_feat_dim=3072,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wandit0-8layer15_timestep500_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/wandit_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk15_t500",
+        video_feat_dim=3072,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wandit0-8layer15_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/backup/wandit_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk15_t300",
+        video_feat_dim=3072,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_cosmosdit0-8layer13_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/cosmosdit_post_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk13_t0300",
+        video_feat_dim=2048,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_cosmosdit0-8layer15_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/cosmosdit_post_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk15_t0300",
+        video_feat_dim=2048,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_cosmosdit0-8layer17_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/cosmosdit_post_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk17_t0300",
+        video_feat_dim=2048,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_cosmosdit0-8layer19_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/cosmosdit_post_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk19_t0300",
+        video_feat_dim=2048,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_cosmosdit0-8layer21_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/cosmosdit_post_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk21_t0300",
+        video_feat_dim=2048,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_cosmosdit0-8layer3_timestep200_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/cosmosdit_post_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk3_t0200",
+        video_feat_dim=2048,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_cosmosdit0-8layer5_timestep200_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/cosmosdit_post_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk5_t0200",
+        video_feat_dim=2048,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_cosmosdit0-8layer7_timestep200_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/cosmosdit_post_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk7_t0200",
+        video_feat_dim=2048,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_cosmosdit0-8layer9_timestep200_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/cosmosdit_post_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk9_t0200",
+        video_feat_dim=2048,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_cosmosdit0-8layer11_timestep200_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/cosmosdit_post_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk11_t0200",
+        video_feat_dim=2048,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_cosmosdit0-8layer13_timestep200_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/cosmosdit_post_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk13_t0200",
+        video_feat_dim=2048,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_cosmosdit0-8layer15_timestep200_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/cosmosdit_post_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk15_t0200",
+        video_feat_dim=2048,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_cosmosdit0-8layer17_timestep200_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/cosmosdit_post_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk17_t0200",
+        video_feat_dim=2048,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_cosmosdit0-8layer19_timestep200_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/cosmosdit_post_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk19_t0200",
+        video_feat_dim=2048,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_cosmosdit0-8layer21_timestep200_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/cosmosdit_post_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk21_t0200",
+        video_feat_dim=2048,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_cosmosdit0-8layer23_timestep200_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/cosmosdit_post_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk23_t0200",
+        video_feat_dim=2048,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_cosmosdit0-8layer25_timestep200_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/cosmosdit_post_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk25_t0200",
+        video_feat_dim=2048,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_cosmosdit0-8layer27_timestep200_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/cosmosdit_post_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk27_t0200",
+        video_feat_dim=2048,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_cosmosditrobotmv0-8layer19_timestep200_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/cosmosdit_robotmv_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk19_t0200",
+        video_feat_dim=2048,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_cosmosditrobotmv0-8layer21_timestep200_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/cosmosdit_robotmv_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk21_t0200",
+        video_feat_dim=2048,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_cosmosditrobotmv0-8layer23_timestep200_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/cosmosdit_robotmv_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk23_t0200",
+        video_feat_dim=2048,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_cosmosditrobotmv0-8layer25_timestep200_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/cosmosdit_robotmv_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk25_t0200",
+        video_feat_dim=2048,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_cosmosditrobotmv0-8layer27_timestep200_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/cosmosdit_robotmv_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk27_t0200",
+        video_feat_dim=2048,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wandit0-8layer15_multi_frame_concat_vla_anchored",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/backup/wandit_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk15_t300",
+        video_feat_dim=3072,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat_vla_anchored",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wandit0-8layer3_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/backup/wandit_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk3_t300",
+        video_feat_dim=3072,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wandit0-8layer5_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/backup/wandit_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk5_t300",
+        video_feat_dim=3072,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wandit0-8layer7_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/backup/wandit_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk7_t300",
+        video_feat_dim=3072,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wandit0-8layer9_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/backup/wandit_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk9_t300",
+        video_feat_dim=3072,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+     
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wandit0-8layer19_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/backup/wandit_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk19_t300",
+        video_feat_dim=3072,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wandit0-8layer23_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/backup/wandit_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk23_t300",
+        video_feat_dim=3072,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wandit0-8layer27_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/backup/wandit_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8__blk27_t300",
+        video_feat_dim=3072,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        video_cache_layout="TCHW",
+        save_interval=5000,
+    ),
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_dino0-8_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/dino_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8",
+        video_feat_dim=768,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        save_interval=5000,
+    ),
+    
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_siglip0-8_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/siglip_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8",
+        video_feat_dim=768,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        save_interval=5000,
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_jepa0-7_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/jepa_cache__image+wrist_image__f0_1_2_3_4_5_6_7",
+        video_feat_dim=1024,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        save_interval=5000,
+    ),
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_vggt0-8_multi_frame_concat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vggt_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8",
+        video_feat_dim=2048,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_concat",
+        mmap_video_cache=True,
+        save_interval=5000,
+    ),
+    
+
+    
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wanvae0-8_temporal_contrastive_concat_weight005_temp007",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="temporal_contrastive_concat",
+        video_contrast_weight=0.05,
+        video_contrast_temperature=0.07,
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wanvae0-8_temporal_contrastive_concat_weight010_temp007",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="temporal_contrastive_concat",
+        video_contrast_weight=0.1,
+        video_contrast_temperature=0.07,
+    ),
+    
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wanvae0-8_temporal_contrastive_concat_weight015_temp007",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="temporal_contrastive_concat",
+        video_contrast_weight=0.15,
+        video_contrast_temperature=0.07,
+    ),
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wanvae0-8_only_temporal_contrastive_concat_weight015",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="temporal_contrastive_concat",
+        video_contrast_weight=0.15,
+        video_contrast_temperature=0.07,
+    ),
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wanvae0-8_temporal_contrastive_concat_weight020_temp007",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="temporal_contrastive_concat",
+        video_contrast_weight=0.2,
+        video_contrast_temperature=0.07,
+    ),
+    
+
+
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wanvae0-8_temporal_contrastive_concat_weight001_temp007",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="temporal_contrastive_concat",
+        video_contrast_weight=0.01,
+        video_contrast_temperature=0.07,
+    ),
+
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_1e-2_wanvae0-8_temporal_reconstruct",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=1e-2,
+        vla_align_layer=11,
+        video_align_mode="temporal_reconstruct"
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_1e-1_wanvae0-8_temporal_reconstruct",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=1e-1,
+        vla_align_layer=11,
+        video_align_mode="temporal_reconstruct"
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wanvae0-8_temporal_reconstruct",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="temporal_reconstruct"
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wanvae0-8_multi_frame_spatial_pe",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_spatial_pe"
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wanvae0-8_multi_frame_temporal_pe",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_temporal_pe"
+    ),
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wanvae0-8_multi_frame_vla_spatial_pe",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_vla_spatial_pe"
+    ),
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wanvae0-8_multi_frame_conv_direct",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_conv_direct"
+    ),
+    
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wanvae0-8_multi_frame_vla_temporal_pe_refine",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+        video_align_mode="multi_frame_vla_temporal_pe_refine"
+    ),
+    
+    
+    TrainConfig(
+        name="pi0_libero_video_layer11_1e-2_wanvae0-8",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=1e-2,
+        vla_align_layer=11,
+    ),
+    
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_1e-1_wanvae0-8",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=1e-1,
+        vla_align_layer=11,
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer11_5e-1_wanvae0-8",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=11,
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer2_5e-1_wanvae0-8",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=2,
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer5_5e-1_wanvae0-8",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=5,
+    ),
+    
+
+
+    TrainConfig(
+        name="pi0_libero_video_layer8_5e-1_wanvae0-8",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=8,
+    ),
+    
+
+    TrainConfig(
+        name="pi0_libero_video_layer14_5e-1_wanvae0-8",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi0_base_torch",
+        num_train_steps=30_000,
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=5e-1,
+        vla_align_layer=14,
+    ),
+    
+    
+    
     TrainConfig(
         name="pi0_libero_low_mem_finetune",
         # Here is an example of loading a pi0 model for LoRA fine-tuning.
@@ -740,25 +4499,281 @@ _CONFIGS = [
         # Turn off EMA for LoRA finetuning.
         ema_decay=None,
     ),
+
     TrainConfig(
-        name="pi05_libero",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        name="pi05_libero_video_align_layer11_1e-1_wanvae0-8_multi_frame_concat",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30, discrete_state_input=False),
         data=LeRobotLiberoDataConfig(
-            repo_id="physical-intelligence/libero",
-            base_config=DataConfig(prompt_from_task=True),
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
             extra_delta_transform=False,
         ),
-        batch_size=256,
+        batch_size=32,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=10_000,
+            warmup_steps=1_000,
             peak_lr=5e-5,
-            decay_steps=1_000_000,
-            decay_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/RoboTwin/policy/pi05/checkpoints/pi05_base_torch",
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=1e-1,
+        num_train_steps=30_000,
+        video_align_mode="multi_frame_concat",
+        vla_align_layer=11,
+        save_interval=5_000,
+    ),
+
+
+    TrainConfig(
+        name="pi05_libero_video_align_layer11_1e-3_wanvae0-8_multi_frame_concat",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/RoboTwin/policy/pi05/checkpoints/pi05_base_torch",
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=1e-3,
+        num_train_steps=30_000,
+        video_align_mode="multi_frame_concat",
+        vla_align_layer=11,
+        save_interval=5_000,
+    ),
+    
+
+    TrainConfig(
+        name="pi05_libero_video_align_layer-1_1e-3_wanvae0-8_multi_frame_concat",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/RoboTwin/policy/pi05/checkpoints/pi05_base_torch",
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=1e-3,
+        num_train_steps=30_000,
+        video_align_mode="multi_frame_concat",
+        vla_align_layer=-1,
+        save_interval=5_000,
+    ),
+    
+
+    TrainConfig(
+        name="pi05_libero_video_align_layer-1_1e-2_wanvae0-8_multi_frame_concat",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi05_base_torch",
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=1e-2,
+        num_train_steps=30_000,
+        video_align_mode="multi_frame_concat",
+        vla_align_layer=-1,
+        save_interval=5_000,
+    ),
+
+    TrainConfig(
+        name="pi05_libero_video_align_layer11_1e-2_wanvae0-8_multi_frame_concat",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/RoboTwin/policy/pi05/checkpoints/pi05_base_torch",
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=1e-2,
+        num_train_steps=30_000,
+        video_align_mode="multi_frame_concat",
+        vla_align_layer=11,
+        save_interval=5_000,
+    ),
+
+    TrainConfig(
+        name="pi05_libero_video_align_layer11_5e-1_wanvae0-8_multi_frame_concat",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/RoboTwin/policy/pi05/checkpoints/pi05_base_torch",
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=5e-1,
+        num_train_steps=30_000,
+        video_align_mode="multi_frame_concat",
+        vla_align_layer=11,
+        save_interval=5_000,
+    ),
+    
+
+    TrainConfig(
+        name="pi05_libero_video_align_1e-2_wanvae0-8",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                # video_delta_frames=[0]
+                # video_delta_frames=[0, 1, 2, 3, 4],
+                video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                # video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                # video_delta_frames=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+                # video_delta_frames=[-8, -7, -6, -5, -4, -3, -2, -1, 0],
+                # video_delta_frames=[-4, -3, -2, -1, 0, 1, 2, 3, 4],
+                # video_delta_frames=[-8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8],
+                video_image_keys=(
+                    "image",
+                    "wrist_image",
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/RoboTwin/policy/pi05/checkpoints/pi05_base_torch",
+        video_cache_path="./assets/pi05_libero_video_align/lerobot_all_repo/vae_cache__image+wrist_image__f0_1_2_3_4_5_6_7_8.pt",
+        video_feat_dim=48,
+        video_align_loss_coeff=1e-2,
+        num_train_steps=30_000,
+    ),
+    
+    
+    TrainConfig(
+        name="pi05_libero",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="lerobot_all_repo",
+            # repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/mnt/data/mqs/workspace/VLA/openpi/checkpoints/pi05_base_torch",
         num_train_steps=30_000,
     ),
     #

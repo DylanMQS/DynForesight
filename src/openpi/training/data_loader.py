@@ -169,7 +169,13 @@ def create_rlds_dataset(
     )
 
 
-def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
+def transform_dataset(
+    dataset: Dataset,
+    data_config: _config.DataConfig,
+    *,
+    skip_norm_stats: bool = False,
+    vae_cache: dict | None = None,
+) -> Dataset:
     """Transform the dataset by applying the data transforms."""
     norm_stats = {}
     if data_config.repo_id != "fake" and not skip_norm_stats:
@@ -180,7 +186,7 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
             )
         norm_stats = data_config.norm_stats
 
-    return TransformedDataset(
+    dataset = TransformedDataset(
         dataset,
         [
             *data_config.repack_transforms.inputs,
@@ -189,6 +195,11 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
             *data_config.model_transforms.inputs,
         ],
     )
+
+    if vae_cache is not None:
+        dataset = _transforms.LookupVaeCache(dataset, vae_cache)
+
+    return dataset
 
 
 def transform_iterable_dataset(
@@ -242,6 +253,28 @@ def create_data_loader(
     data_config = config.data.create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
 
+    vae_cache = None
+    mmap_prefix = None
+    if config.video_cache_path is not None:
+        if getattr(config, "mmap_video_cache", False):
+            mmap_prefix = config.video_cache_path
+            logging.info(f"Will use mmap VAE cache from {mmap_prefix}.mmap")
+        else:
+            logging.info(f"Loading pre-computed VAE cache from {config.video_cache_path}")
+            vae_cache = torch.load(config.video_cache_path, map_location="cpu", weights_only=False)
+            logging.info(f"Loaded {len(vae_cache)} cached VAE features")
+
+    vae_cache_aux = None
+    mmap_prefix_aux = None
+    if getattr(config, "video_cache_path_aux", None) is not None:
+        if getattr(config, "mmap_video_cache", False):
+            mmap_prefix_aux = config.video_cache_path_aux
+            logging.info(f"Will use mmap aux VAE cache from {mmap_prefix_aux}.mmap")
+        else:
+            logging.info(f"Loading aux VAE cache from {config.video_cache_path_aux}")
+            vae_cache_aux = torch.load(config.video_cache_path_aux, map_location="cpu", weights_only=False)
+            logging.info(f"Loaded {len(vae_cache_aux)} aux cached VAE features")
+
     if data_config.rlds_data_dir is not None:
         return create_rlds_data_loader(
             data_config,
@@ -253,7 +286,7 @@ def create_data_loader(
             skip_norm_stats=skip_norm_stats,
             framework=framework,
         )
-    return create_torch_data_loader(
+    result = create_torch_data_loader(
         data_config,
         model_config=config.model,
         action_horizon=config.model.action_horizon,
@@ -265,7 +298,13 @@ def create_data_loader(
         seed=config.seed,
         skip_norm_stats=skip_norm_stats,
         framework=framework,
+        vae_cache=vae_cache,
+        vae_cache_aux=vae_cache_aux,
+        mmap_prefix=mmap_prefix,
+        mmap_prefix_aux=mmap_prefix_aux,
     )
+    del vae_cache, vae_cache_aux
+    return result
 
 
 def create_torch_data_loader(
@@ -281,6 +320,10 @@ def create_torch_data_loader(
     num_workers: int = 0,
     seed: int = 0,
     framework: str = "jax",
+    vae_cache: dict | None = None,
+    vae_cache_aux: dict | None = None,
+    mmap_prefix: str | None = None,
+    mmap_prefix_aux: str | None = None,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -298,9 +341,19 @@ def create_torch_data_loader(
         num_workers: The number of worker processes to use. If zero, the data loader will
             execute in the main process.
         seed: The seed to use for shuffling the data.
+        vae_cache: Pre-computed VAE features dict (index -> tensor).
+        vae_cache_aux: Optional second VAE cache for dual-head alignment.
+        mmap_prefix: Path prefix for mmap cache files (<prefix>.mmap + <prefix>.meta.pt).
+        mmap_prefix_aux: Path prefix for auxiliary mmap cache.
     """
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
-    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats, vae_cache=vae_cache)
+    if mmap_prefix is not None:
+        dataset = _transforms.MmapVaeCache(dataset, mmap_prefix, key="vae_cache")
+    if vae_cache_aux is not None:
+        dataset = _transforms.LookupVaeCache(dataset, vae_cache_aux, key="vae_cache_aux")
+    if mmap_prefix_aux is not None:
+        dataset = _transforms.MmapVaeCache(dataset, mmap_prefix_aux, key="vae_cache_aux")
 
     # Use TorchDataLoader for both frameworks
     # For PyTorch DDP, create DistributedSampler and divide batch size by world size
